@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+
+# Upgrade MongoDB from 3.6 to 4.2.23 for UniFi Controller
+# Author: Chuck Nemeth (forked from Nexxwave https://techblog.nexxwave.eu/update-mongodb-3-6-to-4-4/)
+# MongoDB releases archive:
+#   https://www.mongodb.com/download-center/community/releases/archive
+# MongoDB versions:
+#   https://www.mongodb.com/docs/manual/release-notes/
+# MongoDB upgrade notes:
+#   https://www.mongodb.com/docs/v5.3/release-notes/4.0-upgrade-standalone/
+#   https://www.mongodb.com/docs/v5.3/release-notes/4.2-upgrade-standalone/
+#   https://www.mongodb.com/docs/v5.3/release-notes/4.4-upgrade-standalone/
+
+# Variables
+gpg_key_dir='/usr/local/share/keyrings/'
+mongo_gpg_key="${gpg_key_dir}/mongodb-server-4.4.gpg"
+mongo_port='27117'
+mongo_sources_list='/etc/apt/sources.list.d/mongodb.sources'
+mongo_4_0_archive='mongodb-linux-x86_64-4.0.28.tgz'
+mongo_4_0_dir='/tmp/mongodb-linux-x86_64-4.0.28'
+mongo_4_2_archive='mongodb-linux-x86_64-debian10-4.2.23.tgz'
+mongo_4_2_dir='/tmp/mongodb-linux-x86_64-debian10-4.2.23'
+unifi_db='/var/lib/unifi/db'
+
+# MongoDB 4.4 packages to install
+mongo_packages=(mongodb-org-server mongodb-org-shell)
+
+
+# Colored text
+code_blu() { tput setaf 4; printf '%s\n' "$1"; tput sgr0; }
+code_grn() { tput setaf 2; printf '%s\n' "$1"; tput sgr0; }
+code_red() { tput setaf 1; printf '%s\n' "$1"; tput sgr0; }
+
+
+# Stop UniFi service
+stop_unifi() {
+  code_blu  "[INFO] Stopping UniFi service"
+  systemctl stop unifi.service
+}
+
+
+# Start UniFi service
+start_unifi() {
+  code_blu "[INFO] Starting UniFi service"
+  systemctl start unifi.service
+}
+
+
+check_mongo_engine() {
+  # storage_engine=$(mongo --quiet --port "${mongo_port}" --eval 'db.serverStatus().storageEngine.name')
+  if [[ ! -f '/usr/lib/unifi/data/db/WiredTiger' ]]; then
+    code_red "[ERROR] Storage engine must be Wired Tiger"
+    exit 1
+  fi
+}
+
+
+# Query for MongoDB version (MongoDB server must be running)
+get_mongo_version() {
+  mongo --quiet --port "${mongo_port}" \
+    --eval 'db.adminCommand(
+      {
+        getParameter: 1,
+        featureCompatibilityVersion: 1
+      }
+    ).featureCompatibilityVersion.version'
+}
+
+
+# Download and Extract MongoDB archive. $1 = dir, $2 = archive name
+download_mongodb() {
+  if [[ ! -d "${1}" ]]; then
+    echo
+    code_blu "[INFO] Downloading and extracting ${2}"
+    wget -q "https://fastdl.mongodb.org/linux/${2}" -P /tmp/
+    tar xzf "/tmp/${2}" -C /tmp/
+    chown -R unifi:unifi "${1}"
+  fi
+}
+
+
+# Upgrade MongoDb database
+upgrade_mongo() {
+  code_blu "[INFO] Starting MongoDB in background and sleeping for 60 seconds"
+  sudo -u unifi "${1}/bin/mongod" --port "${mongo_port}" --dbpath "${unifi_db}" &
+  mongo_process=$!
+  sleep 60
+
+  echo
+  code_blu "[INFO] Executing feature compatibility version"
+  if [[ "${2}" == '4.0' ]]; then
+    "${1}/bin/mongo" --port "${mongo_port}" \
+      --eval 'db.adminCommand( { setFeatureCompatibilityVersion: "4.0" } )'
+  fi
+  if [[ "${2}" == '4.2' ]]; then
+    "${1}/bin/mongo" --port "${mongo_port}" \
+      --eval 'db.adminCommand( { setFeatureCompatibilityVersion: "4.2" } )'
+  fi
+
+  echo
+  code_blu "[INFO] Shutting down MongoDB"
+  pkill -P "${mongo_process}"
+  sleep 10
+  echo
+}
+
+
+# Import MongoDB 4.4 GPG key and configure the apt sources.list
+configure_apt() {
+  if [[ ! -d "${gpg_key_dir}" ]]; then
+    code_blu "[INFO] Creating GPG directory for Mongo 4.4 GPG key"
+    mkdir -p "${gpg_key_dir}"
+  fi
+
+  if [[ ! -f "${mongo_gpg_key}" ]]; then
+    code_blu "[INFO] Downloading Mongo 4.4 GPG key"
+    wget -qO - 'https://www.mongodb.org/static/pgp/server-4.4.asc' | \
+      gpg -o "${mongo_gpg_key}" --dearmor
+    chmod 644 "${mongo_gpg_key}"
+  fi
+
+  if [[ ! -f "${mongo_sources_list}" ]]; then
+    code_blu "[INFO] Creating Mongo 4.4 apt sources.list"
+    cat << EOF > "${mongo_sources_list}"
+Types: deb
+URIs: http://repo.mongodb.org/apt/debian
+Suites: buster/mongodb-org/4.4
+Components: main
+Signed-By: ${mongo_gpg_key}
+Architectures: amd64
+EOF
+  chmod 644 "${mongo_sources_list}"
+  fi
+}
+
+
+# Disable old Mongo sources.list
+backup_old_sources() {
+  old_list=$(grep -lr 'mongodb-org/3.6' /etc/apt/sources.list.d/)
+  if [[ "${old_list}" != *".disabled" ]]; then
+    code_blu "[INFO] Creating backup of ${old_list}"
+    mv "${old_list}" "${old_list}.disabled"
+  fi
+}
+
+
+# Upgrade to Mongo 4.4
+upgrade_to_mongo_4_4() {
+  code_blu "[INFO] Installing Mongo 4.4 packages"
+  apt-get update
+  apt-get install -y "${mongo_packages[@]}"
+
+  echo
+  start_unifi
+  code_blu "[INFO] Executing feature compatibility version 4.4"
+  mongo --port "${mongo_port}" \
+    --eval 'db.adminCommand( { setFeatureCompatibilityVersion: "4.4" } )'
+}
+
+
+clean_up() {
+  echo
+  code_blu "[INFO] Cleaning up directories and files in /tmp"
+  rm -f "/tmp/${mongo_4_0_archive}"*
+  rm -f "/tmp/${mongo_4_2_archive}"*
+  rm -rf "${mongo_4_0_dir}"
+  rm -rf "${mongo_4_2_dir}"
+}
+
+
+# Define main program
+main() {
+  # Make sure we're running as root
+  if [[ "$EUID" != 0 ]]; then
+    code_red "[ERROR] Please run as root"
+    exit 1
+  fi
+
+  # Install MongoDB shell for mongo command
+  if ! command -v mongo >/dev/null; then
+    code_blu "[INFO] Installing mongodb-org-shell before proceeding"
+
+    # Pass --allow-unauthenticated due to expired Mongo GPG key
+    apt-get install -y mongodb-org-shell --allow-unauthenticated
+    echo
+  fi
+
+  # Make sure we're using the correct engine
+  check_mongo_engine
+
+  # Get current Mongo version
+  mongo_version=$(get_mongo_version)
+
+  # Exit if already running 4.4
+  if [[ "${mongo_version}" == '4.4' ]]; then
+    code_grn "[INFO] Already running required version: ${mongo_version}"
+    backup_old_sources
+    exit 0
+  fi
+
+  # Stop UniFi if we need to upgrade
+  if [[ "${mongo_version}" != '4.4' ]]; then
+    stop_unifi
+  fi
+
+  # Upgrade to 4.0 if we're on version 3.6
+  if [[ "${mongo_version}" == '3.6' ]]; then
+    download_mongodb "${mongo_4_0_dir}" "${mongo_4_0_archive}"
+    upgrade_mongo "${mongo_4_0_dir}" '4.0'
+    mongo_version='4.0'
+  fi
+
+  # Upgrade to 4.2 if we're on version 4.0
+  if [[ "${mongo_version}" == '4.0' ]]; then
+    download_mongodb "${mongo_4_2_dir}" "${mongo_4_2_archive}"
+    upgrade_mongo "${mongo_4_2_dir}" '4.2'
+    mongo_version='4.2'
+  fi
+
+  # Upgrade to 4.4 if we're on version 4.2
+  if [[ "${mongo_version}" == '4.2' ]]; then
+    configure_apt
+    backup_old_sources
+    upgrade_to_mongo_4_4
+  fi
+
+  backup_old_sources
+  clean_up
+  code_grn "[SUCCESS] Currrent version: $(get_mongo_version)"
+}
+
+
+# Run the things
+main
+
+# vim: ft=sh ts=2 sts=2 sw=2 sr et
