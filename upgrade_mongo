@@ -177,7 +177,7 @@ main() {
   fi
 
   # Install MongoDB shell for mongo command
-  if ! command -v mongo >/dev/null; then
+  if ! command -v mongo >/dev/null 2>&1; then
     code_blu "[INFO] Installing mongodb-org-shell before proceeding"
 
     # Pass --allow-unauthenticated due to expired Mongo GPG key
